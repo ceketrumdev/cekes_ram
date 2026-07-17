@@ -1,0 +1,13 @@
+=====================================================================
+ CEKE'S RAM TEST (AVX2 / Work Stealing Pool / Anti-BSOD 4GB Free)    
+=====================================================================
+
+[+] Horodatage Diagnostic : 2026-07-17 19:49:57
+[+] Cœurs Logiques CPU    : 32 Threads (8 P-Cores | 16 E-Cores)
+[+] RAM Totale Installee   : 63.72 GB
+[+] Marge Systeme OS       : 4.00 GB laisse libre a Windows (Anti-BSOD)
+[+] Allocation Stress      : 59.72 GB (3822 blocs de 16 MB)
+[OK] VirtualAlloc Standard réussi (0x000002BE26C40000)
+[+] Lancement du Benchmark de bande passante initiale...
+[+] Bande Passante Brute Mesurée : 8.19 GB/s
+[+] Détection Mémoire Standard (DDR4) : Auto-Tuning Rowhammer à 100 000 cycles.
