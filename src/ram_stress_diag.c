@@ -128,6 +128,13 @@ static void log_print(OutputMode mode, const char *format, ...) {
     }
 }
 
+static void RestoreConsoleCursor(void) {
+    if (g_hConsole != INVALID_HANDLE_VALUE) {
+        printf("\x1b[?25h");
+        fflush(stdout);
+    }
+}
+
 static void EnableVTTerminalMode(void) {
     g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     if (g_hConsole != INVALID_HANDLE_VALUE) {
@@ -136,6 +143,10 @@ static void EnableVTTerminalMode(void) {
             dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
             SetConsoleMode(g_hConsole, dwMode);
         }
+        // Hide cursor and register restore on exit
+        printf("\x1b[?25l");
+        fflush(stdout);
+        atexit(RestoreConsoleCursor);
     }
 }
 
@@ -457,16 +468,17 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
     double processed_gb = (double)(done * CHUNK_SIZE_BYTES) / (1024.0 * 1024.0 * 1024.0);
     double real_bandwidth = (elapsed_sec > 0.01) ? (processed_gb / elapsed_sec) : 0.0;
 
-    printf(ANSI_CLEAR_SCREEN);
-    printf(ANSI_CYAN "===================================================================================\n" ANSI_RESET);
-    printf(ANSI_BOLD " CEKE'S RAM TEST - DASHBOARD                         \n" ANSI_RESET);
-    printf(ANSI_CYAN "===================================================================================\n" ANSI_RESET);
-    printf(" Module Actuel  : " ANSI_YELLOW "%s" ANSI_RESET "\n", module_name);
-    printf(" Avancement     : [" ANSI_GREEN "%.1f%%" ANSI_RESET "] (%lld / %lld Blocs de 16 MB)\n", pct, (long long)done, (long long)pool->total_chunks);
-    printf(" Débit Restitué : " ANSI_BOLD "%.2f GB/s" ANSI_RESET " | Benchmark Initial : %.2f GB/s\n", real_bandwidth, pool->benchmark_gbs);
-    printf(" Temps Écoulé   : %.1f sec\n\n", elapsed_sec);
+    // Use Cursor Home instead of Clear Screen to completely eliminate blinking/flickering
+    printf("\x1b[H");
+    printf(ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET);
+    printf(ANSI_BOLD " CEKE'S RAM TEST - DASHBOARD\x1b[K\n" ANSI_RESET);
+    printf(ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET);
+    printf(" Module Actuel  : " ANSI_YELLOW "%s" ANSI_RESET "\x1b[K\n", module_name);
+    printf(" Avancement     : [" ANSI_GREEN "%.1f%%" ANSI_RESET "] (%lld / %lld Blocs de 16 MB)\x1b[K\n", pct, (long long)done, (long long)pool->total_chunks);
+    printf(" Débit Restitué : " ANSI_BOLD "%.2f GB/s" ANSI_RESET " | Benchmark Initial : %.2f GB/s\x1b[K\n", real_bandwidth, pool->benchmark_gbs);
+    printf(" Temps Écoulé   : %.1f sec\x1b[K\n\n", elapsed_sec);
 
-    printf(ANSI_BOLD "CARTE GRAPHIQUE DE LA MÉMOIRE RAM (50 BLOCS) :\n" ANSI_RESET);
+    printf(ANSI_BOLD "CARTE GRAPHIQUE DE LA MÉMOIRE RAM (50 BLOCS) :\x1b[K\n" ANSI_RESET);
     printf("[");
     size_t chunks_per_cell = (pool->total_chunks / GRID_CELL_COUNT) + 1;
     for (int cell = 0; cell < GRID_CELL_COUNT; ++cell) {
@@ -488,20 +500,20 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
             printf(".");
         }
     }
-    printf("]\n\n");
+    printf("]\x1b[K\n\n");
 
-    printf(ANSI_BOLD "STATUS MATRICIEL DES THREADS (WORK STEALING POOL) :\n" ANSI_RESET);
+    printf(ANSI_BOLD "STATUS MATRICIEL DES THREADS (WORK STEALING POOL) :\x1b[K\n" ANSI_RESET);
     for (DWORD t = 0; t < num_threads && t < 16; ++t) {
         const char *coreType = contexts[t].is_p_core ? ANSI_CYAN "P-Core" ANSI_RESET : ANSI_YELLOW "E-Core" ANSI_RESET;
         printf(" Thread %02lu [%s] : %4llu blocs ", t, coreType, (unsigned long long)contexts[t].chunks_processed);
         if (contexts[t].errors_found > 0) {
-            printf("| " ANSI_RED "%llu Erreurs" ANSI_RESET "\n", (unsigned long long)contexts[t].errors_found);
+            printf("| " ANSI_RED "%llu Erreurs" ANSI_RESET "\x1b[K\n", (unsigned long long)contexts[t].errors_found);
         } else {
-            printf("| " ANSI_GREEN "0 Erreur" ANSI_RESET "\n");
+            printf("| " ANSI_GREEN "0 Erreur" ANSI_RESET "\x1b[K\n");
         }
     }
     if (num_threads > 16) {
-        printf(" ... (+%lu threads actifs supplémentaires)\n", num_threads - 16);
+        printf(" ... (+%lu threads actifs supplémentaires)\x1b[K\n", num_threads - 16);
     }
     fflush(stdout);
 }
