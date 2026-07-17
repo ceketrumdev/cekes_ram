@@ -459,7 +459,7 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
 
     printf(ANSI_CLEAR_SCREEN);
     printf(ANSI_CYAN "===================================================================================\n" ANSI_RESET);
-    printf(ANSI_BOLD " CEKE'S RAM TEST - DASHBOARD TUI TEMPS RÉEL (GOD MODE v2.4)                         \n" ANSI_RESET);
+    printf(ANSI_BOLD " CEKE'S RAM TEST - DASHBOARD                         \n" ANSI_RESET);
     printf(ANSI_CYAN "===================================================================================\n" ANSI_RESET);
     printf(" Module Actuel  : " ANSI_YELLOW "%s" ANSI_RESET "\n", module_name);
     printf(" Avancement     : [" ANSI_GREEN "%.1f%%" ANSI_RESET "] (%lld / %lld Blocs de 16 MB)\n", pct, (long long)done, (long long)pool->total_chunks);
