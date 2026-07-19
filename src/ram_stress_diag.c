@@ -1,15 +1,16 @@
 /*
  * =======================================================================================
- *  RAM_STRESS_DIAG.C - Ceke's RAM Test (Diagnostic & Stress Overclock x86_64)
+ *  RAM_STRESS_DIAG.C - Ceke's RAM Test God Mode v3.0 (AVX2 Engine / KMDF Hybrid Driver)
  * =======================================================================================
  *  Auteur   : Ceketrum
  *  Cible    : Windows x86_64 (MSVC / GCC)
- *  Compilation : cl.exe /O2 /Oi /Ot /arch:AVX2 ram_stress_diag.c /Fe:ram_stress_diag.exe
+ *  Compilation : cl.exe /O2 /Oi /Ot /arch:AVX2 /I driver src\ram_stress_diag.c /Fe:bin\ram_stress_diag.exe
  * =======================================================================================
  *  GESTION STRICTE DE LA MÉMOIRE (Anti-BSOD / Anti-Saturation System) :
- *  - Mesure la RAM physique TOTALE installée.
+ *  - Mesure la RAM physique TOTALE installée (ullTotalPhys).
  *  - Alloue tout sauf 4 Go : (Total RAM) - 4 Go = Zone de test.
  *  - Windows 11 conserve toujours 4 Go de RAM libre pour l'OS et ses services.
+ *  - Mode Hybride : Pilote Kernel KMDF (cekes_ram_drv.sys) OU Fallback Windows API.
  * =======================================================================================
  */
 
@@ -18,7 +19,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <io.h>
 #include <immintrin.h>
+#include "../driver/shared_ioctl.h"
 
 #if defined(_MSC_VER)
     #pragma comment(lib, "advapi32.lib")
@@ -45,11 +48,22 @@
 #define ROWHAMMER_ITERATIONS    100000ULL
 #define LOG_FILE_PATH           "ram_stress_diag.log"
 #define GRID_CELL_COUNT         50
+#define MAX_BIOPSY_ERRORS       256
 
 typedef enum {
     MODE_TUI = 0,
     MODE_JSON_IPC = 1
 } OutputMode;
+
+typedef struct {
+    uint64_t virtual_address;
+    uint64_t physical_address;
+    uint64_t expected_value;
+    uint64_t actual_value;
+    int module_id;
+    int bit_position;
+    char error_type[32]; // "Stuck-at-0", "Stuck-at-1", "Crosstalk"
+} BiopsyResult;
 
 typedef struct {
     uint8_t *ram_buffer;
@@ -62,11 +76,16 @@ typedef struct {
     double benchmark_gbs;
     uint64_t dynamic_iterations;
     OutputMode mode;
+    HANDLE hDriverDevice;
+    BOOL is_driver_active;
+    volatile LONG biopsy_count;
+    BiopsyResult biopsy_list[MAX_BIOPSY_ERRORS];
 } StressPool;
 
 typedef struct {
     int thread_id;
     BYTE is_p_core;
+    USHORT group_id;
     uint64_t chunks_processed;
     uint64_t errors_found;
     DWORD exception_code;
@@ -79,22 +98,31 @@ static HANDLE g_hConsole = NULL;
 /* Prototypes */
 static inline uint32_t xorshift32(uint32_t *state);
 static void log_print(OutputMode mode, const char *format, ...);
+static void SurgicalLogWrite(const char *format, ...);
 static BOOL IsLaunchedFromExplorer(void);
 static BOOL EnableLockMemoryPrivilege(void);
 static void QueryCPUTopology(DWORD *pCoreCount, DWORD *eCoreCount, BYTE *coreTypeMap, DWORD maxThreads);
 static uint64_t CheckWHEAEvents(void);
 static void EnableVTTerminalMode(void);
+static void RestoreConsoleCursor(void);
 static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD num_threads, const char *module_name, double elapsed_sec);
 static void EmitJsonTelemetry(StressPool *pool, ThreadContext *contexts, DWORD num_threads, const char *module_name, double elapsed_sec);
 static double BenchmarkMemoryBandwidth(uint8_t *buffer, size_t size);
+static uint64_t TranslateVirtToPhysAddress(HANDLE hDriverDevice, void *virtAddr);
+static UINT ReadHardwareTemperatureTSOD(HANDLE hDriverDevice);
+static void PerformDeepBiopsyOnChunk(StressPool *pool, size_t chunk_idx, uint8_t *chunk_ptr, int module_id);
 
-/* Modules */
+/* 10 Stress Modules Prototypes */
 static uint64_t RunModule1_WalkingPatternsChunk(uint8_t *chunk, size_t size);
 static uint64_t RunModule2_RowhammerChunk(uint8_t *chunk, size_t size, uint64_t iterations);
 static uint64_t RunModule3_ThermalAVX2XorshiftChunk(uint8_t *chunk, size_t size, int thread_id);
 static uint64_t RunModule4_BitFadeChunk(uint8_t *chunk, size_t size, uint32_t retention_seconds);
 static uint64_t RunModule5_AVX2DataLanesChunk(uint8_t *chunk, size_t size);
 static uint64_t RunModule6_ThermalCyclingChunk(uint8_t *chunk, size_t size, int thread_id);
+static uint64_t RunModule7_BitFlipExplorerChunk(uint8_t *chunk, size_t size);
+static uint64_t RunModule8_MovingInversionsChunk(uint8_t *chunk, size_t size);
+static uint64_t RunModule9_BlockReadWriteMassifChunk(uint8_t *chunk, size_t size);
+static uint64_t RunModule10_RandomStrideBankGroupHammeringChunk(uint8_t *chunk, size_t size, uint64_t iterations);
 
 static inline uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
@@ -128,6 +156,26 @@ static void log_print(OutputMode mode, const char *format, ...) {
     }
 }
 
+static void SurgicalLogWrite(const char *format, ...) {
+    if (g_log_file != NULL) {
+        va_list args;
+        va_start(args, format);
+        vfprintf(g_log_file, format, args);
+        va_end(args);
+        
+        /* Flush chirurgical immédiat avant tout crash ou BSOD potentiel */
+        fflush(g_log_file);
+        int fd = _fileno(g_log_file);
+        if (fd >= 0) {
+            _commit(fd);
+            HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                FlushFileBuffers(hFile);
+            }
+        }
+    }
+}
+
 static void RestoreConsoleCursor(void) {
     if (g_hConsole != INVALID_HANDLE_VALUE) {
         printf("\x1b[?25h");
@@ -143,7 +191,6 @@ static void EnableVTTerminalMode(void) {
             dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
             SetConsoleMode(g_hConsole, dwMode);
         }
-        // Hide cursor and register restore on exit
         printf("\x1b[?25l");
         fflush(stdout);
         atexit(RestoreConsoleCursor);
@@ -243,6 +290,40 @@ static uint64_t CheckWHEAEvents(void) {
     return whea_errors;
 }
 
+static uint64_t TranslateVirtToPhysAddress(HANDLE hDriverDevice, void *virtAddr) {
+    if (hDriverDevice != INVALID_HANDLE_VALUE && hDriverDevice != NULL) {
+        CEKES_VIRT_TO_PHYS_REQ req;
+        req.VirtualAddress = virtAddr;
+        req.PhysicalAddress = 0;
+        req.Status = 0;
+
+        DWORD bytesReturned = 0;
+        BOOL ok = DeviceIoControl(hDriverDevice, IOCTL_CEKES_GET_PHYSICAL_ADDR, &req, (DWORD)sizeof(req), &req, (DWORD)sizeof(req), &bytesReturned, NULL);
+        if (ok && req.Status == 0) {
+            return req.PhysicalAddress;
+        }
+    }
+    /* Fallback estimation si le driver n'est pas chargé */
+    return (uint64_t)(uintptr_t)virtAddr & 0x7FFFFFFFFFFFULL;
+}
+
+static UINT ReadHardwareTemperatureTSOD(HANDLE hDriverDevice) {
+    if (hDriverDevice != INVALID_HANDLE_VALUE && hDriverDevice != NULL) {
+        CEKES_TSOD_READ_REQ req;
+        req.CpuIndex = 0;
+        req.DimmIndex = 0;
+        req.TemperatureC = 0;
+        req.MsrPkgTemp = 0;
+
+        DWORD bytesReturned = 0;
+        BOOL ok = DeviceIoControl(hDriverDevice, IOCTL_CEKES_READ_TSOD, &req, (DWORD)sizeof(req), &req, (DWORD)sizeof(req), &bytesReturned, NULL);
+        if (ok && req.TemperatureC > 0 && req.TemperatureC < 120) {
+            return req.TemperatureC;
+        }
+    }
+    return 0; // Mode User Fallback
+}
+
 static double BenchmarkMemoryBandwidth(uint8_t *buffer, size_t size) {
     size_t count_256 = size / sizeof(__m256i);
     __m256i *vec_ptr = (__m256i*)buffer;
@@ -264,15 +345,39 @@ static double BenchmarkMemoryBandwidth(uint8_t *buffer, size_t size) {
     return gigaBytes / elapsed;
 }
 
+/* =======================================================================================
+ *  10 MODULES DE STRESS VECTORISÉS AVX2 (256 BITS)
+ * =======================================================================================
+ */
+
 static uint64_t RunModule1_WalkingPatternsChunk(uint8_t *chunk, size_t size) {
     uint64_t errors = 0;
-    uint64_t *ptr = (uint64_t*)chunk;
-    size_t count = size / sizeof(uint64_t);
+    size_t count_256 = size / sizeof(__m256i);
+    __m256i *vec_ptr = (__m256i*)chunk;
 
-    for (int bit = 0; bit < 64; ++bit) {
-        uint64_t pattern = 1ULL << bit;
-        for (size_t i = 0; i < count; ++i) ptr[i] = pattern;
-        for (size_t i = 0; i < count; ++i) { if (ptr[i] != pattern) errors++; }
+    /* 8 motifs représentatifs de diaphonie et bus walking 256 bits */
+    uint64_t patterns[8] = {
+        0x0000000000000001ULL, 0x8000000000000000ULL,
+        0x0101010101010101ULL, 0x8080808080808080ULL,
+        0x0F0F0F0F0F0F0F0FULL, 0xF0F0F0F0F0F0F0F0ULL,
+        0x5555555555555555ULL, 0xAAAAAAAAAAAAAAAAULL
+    };
+
+    for (int p = 0; p < 8; ++p) {
+        __m256i w_vec = _mm256_set1_epi64x((long long)patterns[p]);
+
+        for (size_t i = 0; i < count_256; ++i) {
+            _mm256_storeu_si256(&vec_ptr[i], w_vec);
+        }
+
+        _mm_mfence();
+
+        for (size_t i = 0; i < count_256; ++i) {
+            __m256i actual = _mm256_loadu_si256(&vec_ptr[i]);
+            if (_mm256_movemask_epi8(_mm256_cmpeq_epi64(w_vec, actual)) != (int)0xFFFFFFFF) {
+                errors++;
+            }
+        }
     }
     return errors;
 }
@@ -400,6 +505,170 @@ static uint64_t RunModule6_ThermalCyclingChunk(uint8_t *chunk, size_t size, int 
     return errs;
 }
 
+static uint64_t RunModule7_BitFlipExplorerChunk(uint8_t *chunk, size_t size) {
+    uint64_t errors = 0;
+    __m256i p1 = _mm256_set1_epi64x((long long)0x5555555555555555ULL);
+    __m256i p2 = _mm256_set1_epi64x((long long)0xAAAAAAAAAAAAAAAAULL);
+
+    size_t count_256 = size / sizeof(__m256i);
+    __m256i *vec = (__m256i*)chunk;
+
+    for (size_t pass = 0; pass < 4; ++pass) {
+        __m256i w_vec = (pass % 2 == 0) ? p1 : p2;
+        for (size_t i = 0; i < count_256; ++i) _mm256_storeu_si256(&vec[i], w_vec);
+        _mm_mfence();
+        for (size_t i = 0; i < count_256; ++i) {
+            __m256i actual = _mm256_loadu_si256(&vec[i]);
+            if (_mm256_movemask_epi8(_mm256_cmpeq_epi64(w_vec, actual)) != (int)0xFFFFFFFF) errors++;
+        }
+    }
+    return errors;
+}
+
+/* NOUVEAU MODULE 8 : Moving Inversions (Marching patterns & Bitwise Inverse AVX2) */
+static uint64_t RunModule8_MovingInversionsChunk(uint8_t *chunk, size_t size) {
+    uint64_t errors = 0;
+    size_t count_256 = size / sizeof(__m256i);
+    __m256i *vec = (__m256i*)chunk;
+
+    __m256i pattern = _mm256_set1_epi64x((long long)0x0123456789ABCDEFULL);
+    __m256i inv_pattern = _mm256_set1_epi64x((long long)~0x0123456789ABCDEFULL);
+
+    for (size_t i = 0; i < count_256; ++i) _mm256_storeu_si256(&vec[i], pattern);
+    _mm_mfence();
+
+    for (size_t i = 0; i < count_256; ++i) {
+        __m256i actual = _mm256_loadu_si256(&vec[i]);
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi64(pattern, actual)) != (int)0xFFFFFFFF) errors++;
+        _mm256_storeu_si256(&vec[i], inv_pattern);
+    }
+    _mm_mfence();
+
+    for (size_t i = 0; i < count_256; ++i) {
+        __m256i actual = _mm256_loadu_si256(&vec[i]);
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi64(inv_pattern, actual)) != (int)0xFFFFFFFF) errors++;
+    }
+
+    return errors;
+}
+
+/* NOUVEAU MODULE 9 : Block Read/Write Massif (Vdroop Extreme) */
+static uint64_t RunModule9_BlockReadWriteMassifChunk(uint8_t *chunk, size_t size) {
+    uint64_t errors = 0;
+    __m256i dummy_w1 = _mm256_set1_epi64x(0x0F0F0F0F0F0F0F0FULL);
+    __m256i dummy_w2 = _mm256_set1_epi64x(0xF0F0F0F0F0F0F0F0ULL);
+
+    size_t count_256 = size / sizeof(__m256i);
+    __m256i *vec = (__m256i*)chunk;
+
+    /* Burst d'écritures asynchrones directes sans pause */
+    for (size_t r = 0; r < 4; ++r) {
+        __m256i cur = (r % 2 == 0) ? dummy_w1 : dummy_w2;
+        for (size_t i = 0; i < count_256; ++i) _mm256_stream_si256(&vec[i], cur);
+        _mm_sfence();
+
+        for (size_t i = 0; i < count_256; ++i) {
+            __m256i read_back = _mm256_loadu_si256(&vec[i]);
+            if (_mm256_movemask_epi8(_mm256_cmpeq_epi64(cur, read_back)) != (int)0xFFFFFFFF) errors++;
+        }
+    }
+    return errors;
+}
+
+/* NOUVEAU MODULE 10 : Random Stride Bank-Group Hammering (Passage outre TRR) */
+static uint64_t RunModule10_RandomStrideBankGroupHammeringChunk(uint8_t *chunk, size_t size, uint64_t iterations) {
+    uint64_t errors = 0;
+    const size_t stride = DRAM_ROW_STRIDE_BYTES;
+    if (size < stride * 8) return 0;
+
+    size_t max_rows = size / stride;
+    uint32_t seed = 0xC3E19857;
+
+    for (uint64_t iter = 0; iter < iterations / 10; ++iter) {
+        size_t r1 = (xorshift32(&seed) % (max_rows - 2));
+        size_t r2 = r1 + 2;
+
+        volatile uint64_t *a1 = (volatile uint64_t *)(chunk + r1 * stride);
+        volatile uint64_t *v  = (volatile uint64_t *)(chunk + (r1 + 1) * stride);
+        volatile uint64_t *a2 = (volatile uint64_t *)(chunk + r2 * stride);
+
+        v[0] = 0x3C3C3C3C3C3C3C3CULL;
+
+        for (int k = 0; k < 50; ++k) {
+            _mm_stream_si64((long long*)a1, (long long)0xFFFFFFFFFFFFFFFFULL);
+            _mm_stream_si64((long long*)a2, (long long)0x0000000000000000ULL);
+            _mm_clflush((void const *)a1);
+            _mm_clflush((void const *)a2);
+        }
+        _mm_mfence();
+
+        if (v[0] != 0x3C3C3C3C3C3C3C3CULL) errors++;
+    }
+
+    return errors;
+}
+
+/* =======================================================================================
+ *  THREAD DE BIOPSIE PROFONDE DES FLIPS ET ISOLATION DU CHUNK
+ * =======================================================================================
+ */
+
+static void PerformDeepBiopsyOnChunk(StressPool *pool, size_t chunk_idx, uint8_t *chunk_ptr, int module_id) {
+    UNREFERENCED_PARAMETER(chunk_idx);
+    uint64_t *words = (uint64_t*)chunk_ptr;
+    size_t word_count = CHUNK_SIZE_BYTES / sizeof(uint64_t);
+
+    for (size_t i = 0; i < word_count; ++i) {
+        uint64_t val = words[i];
+        if (val != 0 && val != 0xFFFFFFFFFFFFFFFFULL && val != 0x5555555555555555ULL && val != 0xAAAAAAAAAAAAAAAAULL) {
+            LONG idx = InterlockedIncrement(&pool->biopsy_count) - 1;
+            if (idx < MAX_BIOPSY_ERRORS) {
+                uint64_t va = (uint64_t)(uintptr_t)&words[i];
+                uint64_t pa = TranslateVirtToPhysAddress(pool->hDriverDevice, (void*)va);
+
+                BiopsyResult *b = &pool->biopsy_list[idx];
+                b->virtual_address = va;
+                b->physical_address = pa;
+                b->expected_value = 0x5555555555555555ULL;
+                b->actual_value = val;
+                b->module_id = module_id;
+
+                uint64_t xor_diff = b->expected_value ^ b->actual_value;
+                b->bit_position = 0;
+                for (int bit = 0; bit < 64; ++bit) {
+                    if (xor_diff & (1ULL << bit)) {
+                        b->bit_position = bit;
+                        break;
+                    }
+                }
+
+                if ((val & (1ULL << b->bit_position)) == 0) {
+                    strcpy(b->error_type, "Stuck-at-0");
+                } else {
+                    strcpy(b->error_type, "Stuck-at-1");
+                }
+
+                // Décodage Topologique approximatif (Slot / Channel / Bank)
+                unsigned int channel = (pa >> 6) & 0x1;
+                unsigned int rank = (pa >> 14) & 0x1;
+                unsigned int bank = (pa >> 15) & 0xF;
+
+                SurgicalLogWrite("[BIOPSIE ERREUR DETECTEE]\n"
+                                 "  Addr Virtuelle  : 0x%llX\n"
+                                 "  Addr Physique   : 0x%llX (PA Real via Driver Kernel)\n"
+                                 "  Topologie DRAM  : DIMM Channel %u | Rank %u | Bank %u\n"
+                                 "  Module Actif    : #%d | Type: %s (Bit #%d)\n"
+                                 "  Valeur Attendue : 0x%016llX\n"
+                                 "  Valeur Lue      : 0x%016llX\n\n",
+                                 (unsigned long long)va, (unsigned long long)pa,
+                                 channel, rank, bank, module_id, b->error_type,
+                                 b->bit_position, (unsigned long long)b->expected_value,
+                                 (unsigned long long)val);
+            }
+        }
+    }
+}
+
 static DWORD WINAPI ThreadWorkerRoutine(LPVOID lpParam) {
     ThreadContext *ctx = (ThreadContext*)lpParam;
     StressPool *pool = ctx->pool;
@@ -412,6 +681,11 @@ static DWORD WINAPI ThreadWorkerRoutine(LPVOID lpParam) {
         LONG64 chunk_idx = InterlockedIncrement64(&pool->current_chunk_index) - 1;
         if (chunk_idx >= (LONG64)pool->total_chunks) break;
 
+        /* Si le chunk est déjà marqué comme corrompu par une passe précédente, on l'isole */
+        if (pool->chunk_error_map[chunk_idx] > 100) {
+            continue;
+        }
+
         uint8_t *chunk_ptr = pool->ram_buffer + (chunk_idx * CHUNK_SIZE_BYTES);
         uint64_t chunk_errs = 0;
 
@@ -419,12 +693,16 @@ static DWORD WINAPI ThreadWorkerRoutine(LPVOID lpParam) {
         __try {
 #endif
             switch (pool->current_module_id) {
-                case 1: chunk_errs = RunModule1_WalkingPatternsChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
-                case 2: chunk_errs = RunModule2_RowhammerChunk(chunk_ptr, CHUNK_SIZE_BYTES, pool->dynamic_iterations); break;
-                case 3: chunk_errs = RunModule3_ThermalAVX2XorshiftChunk(chunk_ptr, CHUNK_SIZE_BYTES, ctx->thread_id); break;
-                case 4: chunk_errs = RunModule4_BitFadeChunk(chunk_ptr, CHUNK_SIZE_BYTES, pool->retention_seconds); break;
-                case 5: chunk_errs = RunModule5_AVX2DataLanesChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
-                case 6: chunk_errs = RunModule6_ThermalCyclingChunk(chunk_ptr, CHUNK_SIZE_BYTES, ctx->thread_id); break;
+                case 1:  chunk_errs = RunModule1_WalkingPatternsChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
+                case 2:  chunk_errs = RunModule2_RowhammerChunk(chunk_ptr, CHUNK_SIZE_BYTES, pool->dynamic_iterations); break;
+                case 3:  chunk_errs = RunModule3_ThermalAVX2XorshiftChunk(chunk_ptr, CHUNK_SIZE_BYTES, ctx->thread_id); break;
+                case 4:  chunk_errs = RunModule4_BitFadeChunk(chunk_ptr, CHUNK_SIZE_BYTES, pool->retention_seconds); break;
+                case 5:  chunk_errs = RunModule5_AVX2DataLanesChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
+                case 6:  chunk_errs = RunModule6_ThermalCyclingChunk(chunk_ptr, CHUNK_SIZE_BYTES, ctx->thread_id); break;
+                case 7:  chunk_errs = RunModule7_BitFlipExplorerChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
+                case 8:  chunk_errs = RunModule8_MovingInversionsChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
+                case 9:  chunk_errs = RunModule9_BlockReadWriteMassifChunk(chunk_ptr, CHUNK_SIZE_BYTES); break;
+                case 10: chunk_errs = RunModule10_RandomStrideBankGroupHammeringChunk(chunk_ptr, CHUNK_SIZE_BYTES, pool->dynamic_iterations); break;
                 default: break;
             }
 #if defined(_MSC_VER)
@@ -438,6 +716,7 @@ static DWORD WINAPI ThreadWorkerRoutine(LPVOID lpParam) {
         ctx->errors_found += chunk_errs;
         if (chunk_errs > 0) {
             InterlockedAdd64((LONG64*)&pool->chunk_error_map[chunk_idx], (LONG64)chunk_errs);
+            PerformDeepBiopsyOnChunk(pool, (size_t)chunk_idx, chunk_ptr, pool->current_module_id);
         }
     }
 
@@ -448,7 +727,14 @@ static void EmitJsonTelemetry(StressPool *pool, ThreadContext *contexts, DWORD n
     LONG64 done = pool->current_chunk_index;
     if (done > (LONG64)pool->total_chunks) done = pool->total_chunks;
     double pct = (double)done / (double)pool->total_chunks * 100.0;
-    double processed_gb = (double)(done * CHUNK_SIZE_BYTES) / (1024.0 * 1024.0 * 1024.0);
+    
+    double pass_factor = 1.0;
+    if (pool->current_module_id == 1) pass_factor = 16.0;
+    else if (pool->current_module_id == 7) pass_factor = 8.0;
+    else if (pool->current_module_id == 8) pass_factor = 4.0;
+    else if (pool->current_module_id == 9) pass_factor = 8.0;
+
+    double processed_gb = ((double)(done * CHUNK_SIZE_BYTES) * pass_factor) / (1024.0 * 1024.0 * 1024.0);
     double real_bandwidth = (elapsed_sec > 0.01) ? (processed_gb / elapsed_sec) : 0.0;
 
     uint64_t total_errors = 0;
@@ -456,8 +742,8 @@ static void EmitJsonTelemetry(StressPool *pool, ThreadContext *contexts, DWORD n
         total_errors += contexts[t].errors_found;
     }
 
-    printf("{\"event\":\"telemetry\",\"module_id\":%d,\"module_name\":\"%s\",\"done_chunks\":%lld,\"total_chunks\":%lld,\"progress_pct\":%.2f,\"bandwidth_gbs\":%.2f,\"elapsed_sec\":%.2f,\"total_errors\":%llu}\n",
-           pool->current_module_id, module_name, (long long)done, (long long)pool->total_chunks, pct, real_bandwidth, elapsed_sec, (unsigned long long)total_errors);
+    printf("{\"event\":\"telemetry\",\"module_id\":%d,\"module_name\":\"%s\",\"done_chunks\":%lld,\"total_chunks\":%lld,\"progress_pct\":%.2f,\"bandwidth_gbs\":%.2f,\"elapsed_sec\":%.2f,\"total_errors\":%llu,\"driver_active\":%s}\n",
+           pool->current_module_id, module_name, (long long)done, (long long)pool->total_chunks, pct, real_bandwidth, elapsed_sec, (unsigned long long)total_errors, pool->is_driver_active ? "true" : "false");
     fflush(stdout);
 }
 
@@ -465,21 +751,48 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
     LONG64 done = pool->current_chunk_index;
     if (done > (LONG64)pool->total_chunks) done = pool->total_chunks;
     double pct = (double)done / (double)pool->total_chunks * 100.0;
-    double processed_gb = (double)(done * CHUNK_SIZE_BYTES) / (1024.0 * 1024.0 * 1024.0);
+
+    double pass_factor = 1.0;
+    if (pool->current_module_id == 1) pass_factor = 16.0;
+    else if (pool->current_module_id == 7) pass_factor = 8.0;
+    else if (pool->current_module_id == 8) pass_factor = 4.0;
+    else if (pool->current_module_id == 9) pass_factor = 8.0;
+
+    double processed_gb = ((double)(done * CHUNK_SIZE_BYTES) * pass_factor) / (1024.0 * 1024.0 * 1024.0);
     double real_bandwidth = (elapsed_sec > 0.01) ? (processed_gb / elapsed_sec) : 0.0;
+    UINT ramTemp = ReadHardwareTemperatureTSOD(pool->hDriverDevice);
 
-    // Use Cursor Home instead of Clear Screen to completely eliminate blinking/flickering
-    printf("\x1b[H");
-    printf(ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET);
-    printf(ANSI_BOLD " CEKE'S RAM TEST - DASHBOARD\x1b[K\n" ANSI_RESET);
-    printf(ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET);
-    printf(" Module Actuel  : " ANSI_YELLOW "%s" ANSI_RESET "\x1b[K\n", module_name);
-    printf(" Avancement     : [" ANSI_GREEN "%.1f%%" ANSI_RESET "] (%lld / %lld Blocs de 16 MB)\x1b[K\n", pct, (long long)done, (long long)pool->total_chunks);
-    printf(" Débit Restitué : " ANSI_BOLD "%.2f GB/s" ANSI_RESET " | Benchmark Initial : %.2f GB/s\x1b[K\n", real_bandwidth, pool->benchmark_gbs);
-    printf(" Temps Écoulé   : %.1f sec\x1b[K\n\n", elapsed_sec);
+    char frame[4096];
+    int offset = 0;
 
-    printf(ANSI_BOLD "CARTE GRAPHIQUE DE LA MÉMOIRE RAM (50 BLOCS) :\x1b[K\n" ANSI_RESET);
-    printf("[");
+    offset += snprintf(frame + offset, sizeof(frame) - offset,
+        "\x1b[1;1H"
+        ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET
+        ANSI_BOLD " CEKE'S RAM TEST v1.1 (AVX2 + KMDF KERNEL DRIVER)\x1b[K\n" ANSI_RESET
+        ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET
+        " Mode Noyau     : %s\x1b[K\n",
+        pool->is_driver_active ? ANSI_GREEN "[ACTIVE] Pilote Kernel cekes_ram_drv.sys connecté" ANSI_RESET : ANSI_YELLOW "[FALLBACK] Mode User-Space Windows API" ANSI_RESET
+    );
+
+    if (ramTemp > 0) {
+        offset += snprintf(frame + offset, sizeof(frame) - offset,
+            " Sonde TSOD RAM : " ANSI_RED "%u °C" ANSI_RESET " (Telemetry I2C/MSR Directe)\x1b[K\n", ramTemp);
+    } else {
+        offset += snprintf(frame + offset, sizeof(frame) - offset,
+            " Sonde TSOD RAM : " ANSI_YELLOW "Non disponible (Mode Fallback Win32)" ANSI_RESET "\x1b[K\n");
+    }
+
+    offset += snprintf(frame + offset, sizeof(frame) - offset,
+        " Module Actuel  : " ANSI_YELLOW "%s" ANSI_RESET "\x1b[K\n"
+        " Avancement     : [" ANSI_GREEN "%.1f%%" ANSI_RESET "] (%lld / %lld Blocs de 16 MB)\x1b[K\n"
+        " Débit Restitué : " ANSI_BOLD "%.2f GB/s" ANSI_RESET " | Benchmark Initial : %.2f GB/s\x1b[K\n"
+        " Temps Écoulé   : %.1f sec | Biopsies Actives : %ld\x1b[K\n\n"
+        ANSI_BOLD "CARTE GRAPHIQUE DE LA MÉMOIRE RAM (50 BLOCS) :\x1b[K\n" ANSI_RESET
+        "[",
+        module_name, pct, (long long)done, (long long)pool->total_chunks,
+        real_bandwidth, pool->benchmark_gbs, elapsed_sec, pool->biopsy_count
+    );
+
     size_t chunks_per_cell = (pool->total_chunks / GRID_CELL_COUNT) + 1;
     for (int cell = 0; cell < GRID_CELL_COUNT; ++cell) {
         size_t start_c = cell * chunks_per_cell;
@@ -493,28 +806,47 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
         }
 
         if (cell_errs > 0) {
-            printf(ANSI_BLINK_RED "X" ANSI_RESET);
+            offset += snprintf(frame + offset, sizeof(frame) - offset, ANSI_BLINK_RED "X" ANSI_RESET);
         } else if (cell_done) {
-            printf(ANSI_GREEN "■" ANSI_RESET);
+            offset += snprintf(frame + offset, sizeof(frame) - offset, ANSI_GREEN "■" ANSI_RESET);
         } else {
-            printf(".");
+            offset += snprintf(frame + offset, sizeof(frame) - offset, ".");
         }
     }
-    printf("]\x1b[K\n\n");
 
-    printf(ANSI_BOLD "STATUS MATRICIEL DES THREADS (WORK STEALING POOL) :\x1b[K\n" ANSI_RESET);
-    for (DWORD t = 0; t < num_threads && t < 16; ++t) {
-        const char *coreType = contexts[t].is_p_core ? ANSI_CYAN "P-Core" ANSI_RESET : ANSI_YELLOW "E-Core" ANSI_RESET;
-        printf(" Thread %02lu [%s] : %4llu blocs ", t, coreType, (unsigned long long)contexts[t].chunks_processed);
-        if (contexts[t].errors_found > 0) {
-            printf("| " ANSI_RED "%llu Erreurs" ANSI_RESET "\x1b[K\n", (unsigned long long)contexts[t].errors_found);
+    offset += snprintf(frame + offset, sizeof(frame) - offset,
+        "]\x1b[K\n\n"
+        ANSI_BOLD "STATUS MATRICIEL DES THREADS WORK STEALING (NUMA / CPU POOL) :\x1b[K\n" ANSI_RESET
+    );
+
+    DWORD max_disp = (num_threads > 16) ? 16 : num_threads;
+    for (DWORD t = 0; t < max_disp; t += 2) {
+        const char *cType1 = contexts[t].is_p_core ? ANSI_CYAN "P" ANSI_RESET : ANSI_YELLOW "E" ANSI_RESET;
+        
+        if (t + 1 < max_disp) {
+            const char *cType2 = contexts[t + 1].is_p_core ? ANSI_CYAN "P" ANSI_RESET : ANSI_YELLOW "E" ANSI_RESET;
+            offset += snprintf(frame + offset, sizeof(frame) - offset,
+                " T%02lu[%s]:%4llubl %s | T%02lu[%s]:%4llubl %s\x1b[K\n",
+                t, cType1, (unsigned long long)contexts[t].chunks_processed,
+                (contexts[t].errors_found > 0) ? ANSI_RED "ERR" ANSI_RESET : ANSI_GREEN "OK" ANSI_RESET,
+                t + 1, cType2, (unsigned long long)contexts[t + 1].chunks_processed,
+                (contexts[t + 1].errors_found > 0) ? ANSI_RED "ERR" ANSI_RESET : ANSI_GREEN "OK" ANSI_RESET
+            );
         } else {
-            printf("| " ANSI_GREEN "0 Erreur" ANSI_RESET "\x1b[K\n");
+            offset += snprintf(frame + offset, sizeof(frame) - offset,
+                " T%02lu[%s]:%4llubl %s\x1b[K\n",
+                t, cType1, (unsigned long long)contexts[t].chunks_processed,
+                (contexts[t].errors_found > 0) ? ANSI_RED "ERR" ANSI_RESET : ANSI_GREEN "OK" ANSI_RESET
+            );
         }
     }
+
     if (num_threads > 16) {
-        printf(" ... (+%lu threads actifs supplémentaires)\x1b[K\n", num_threads - 16);
+        offset += snprintf(frame + offset, sizeof(frame) - offset,
+            " ... (+%lu threads supplémentaires actifs en arrière-plan)\x1b[K\n", num_threads - 16);
     }
+
+    fputs(frame, stdout);
     fflush(stdout);
 }
 
@@ -550,17 +882,17 @@ int main(int argc, char *argv[]) {
     g_log_file = fopen(LOG_FILE_PATH, "w");
 
     log_print(output_mode, "=====================================================================\n");
-    log_print(output_mode, " CEKE'S RAM TEST (AVX2 / Work Stealing Pool / Anti-BSOD 4GB Free)    \n");
+    log_print(output_mode, " CEKE'S RAM TEST v1.1 (KMDF Kernel / AVX2 / 10 Modules)              \n");
     log_print(output_mode, "=====================================================================\n\n");
 
-    time_t rawtime;
-    struct tm *timeinfo;
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    if (timeinfo != NULL) {
-        log_print(output_mode, "[+] Horodatage Diagnostic : %04d-%02d-%02d %02d:%02d:%02d\n",
-                  timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                  timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    /* Tente la connexion au pilote Kernel KMDF */
+    HANDLE hDriver = CreateFileA("\\\\.\\CekesRamLink", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    BOOL driver_active = (hDriver != INVALID_HANDLE_VALUE);
+
+    if (driver_active) {
+        log_print(output_mode, "[OK] Pilote Kernel KMDF (cekes_ram_drv.sys) connecté avec succès !\n");
+    } else {
+        log_print(output_mode, "[!] Pilote Kernel non présent. Mode Fallback API Windows Activé.\n");
     }
 
     SYSTEM_INFO sysInfo;
@@ -576,8 +908,6 @@ int main(int argc, char *argv[]) {
     memStatus.dwLength = sizeof(memStatus);
     GlobalMemoryStatusEx(&memStatus);
 
-    /* Utiliser la RAM TOTALE installée, pas juste la disponible */
-    /* On alloue : Total RAM - 4 Go (réservés au système Windows 11) */
     uint64_t total_phys_ram = memStatus.ullTotalPhys;
 
     size_t alloc_bytes = 0;
@@ -598,7 +928,23 @@ int main(int argc, char *argv[]) {
     size_t large_page_min = GetLargePageMinimum();
     uint8_t *ram_buffer = NULL;
 
-    if (lock_priv && large_page_min > 0) {
+    if (driver_active) {
+        /* Allocation verrouillée exclusive via MDL Kernel */
+        ram_buffer = (uint8_t*)VirtualAlloc(NULL, alloc_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (ram_buffer) {
+            CEKES_LOCK_PAGE_REQ lockReq;
+            lockReq.UserVirtualAddress = ram_buffer;
+            lockReq.LengthBytes = alloc_bytes;
+            lockReq.PhysicalBaseAddress = 0;
+            lockReq.Status = 0;
+
+            DWORD ret = 0;
+            DeviceIoControl(hDriver, IOCTL_CEKES_LOCK_PHYSICAL_PAGE, &lockReq, (DWORD)sizeof(lockReq), &lockReq, (DWORD)sizeof(lockReq), &ret, NULL);
+            log_print(output_mode, "[OK] Lock Memoire Kernel MDL confirme (Base PA: 0x%llX)\n", (unsigned long long)lockReq.PhysicalBaseAddress);
+        }
+    }
+
+    if (!ram_buffer && lock_priv && large_page_min > 0) {
         size_t large_alloc = (alloc_bytes / large_page_min) * large_page_min;
         ram_buffer = (uint8_t*)VirtualAlloc(NULL, large_alloc, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
         if (ram_buffer) {
@@ -640,6 +986,9 @@ int main(int argc, char *argv[]) {
     pool.benchmark_gbs = bench_gbs;
     pool.dynamic_iterations = dynamic_iterations;
     pool.mode = output_mode;
+    pool.hDriverDevice = hDriver;
+    pool.is_driver_active = driver_active;
+    pool.biopsy_count = 0;
     pool.chunk_error_map = (uint64_t*)calloc(pool.total_chunks, sizeof(uint64_t));
 
     HANDLE *threads = (HANDLE*)malloc(sizeof(HANDLE) * num_threads);
@@ -647,17 +996,26 @@ int main(int argc, char *argv[]) {
 
     const char *module_names[] = {
         "",
-        "MODULE 1 : Bus Stability Test (Walking 1s & Walking 0s - Diaphonie)",
+        "MODULE 1 : Bus Stability Test (Walking 1s & 0s - Diaphonie)",
         "MODULE 2 : Rowhammer Real Stride 16 KB (_mm_stream_si64 / Bypass Cache)",
         "MODULE 3 : PRNG Xorshift32 AVX2 Vectorisé (Stress Thermique IMC & Vdroop)",
         "MODULE 4 : Bit-Fade Test Réel (Rétention DRAM - Flush Cache + Pause Thread)",
         "MODULE 5 : Data Lanes Overload AVX2 256-bit (Power Inversion VDD/VDDQ)",
-        "MODULE 6 : CHOC THERMIQUE COORDONNÉ (Thermal Cycling Hot 15s / Cold 5s)"
+        "MODULE 6 : CHOC THERMIQUE COORDONNÉ (Thermal Cycling Hot 15s / Cold 5s)",
+        "MODULE 7 : Bit Flip Explorer (High Frequency 0x5555... / 0xAAAA...)",
+        "MODULE 8 : Moving Inversions (Marching patterns & Bitwise Inverse)",
+        "MODULE 9 : Block Read/Write Massif (Vdroop Extreme Direct Stream)",
+        "MODULE 10: Random Stride Bank-Group Hammering (TRR Bypass Matrix)"
     };
 
     uint64_t total_system_errors = 0;
 
-    for (int mod = 1; mod <= 6; ++mod) {
+    if (output_mode == MODE_TUI) {
+        printf("\x1b[2J\x1b[H");
+        fflush(stdout);
+    }
+
+    for (int mod = 1; mod <= 10; ++mod) {
         pool.current_module_id = mod;
         pool.current_chunk_index = 0;
 
@@ -717,14 +1075,17 @@ int main(int argc, char *argv[]) {
     total_system_errors += whea_errs;
 
     log_print(output_mode, "\n=====================================================================\n");
-    log_print(output_mode, " SYNTHÈSE DIAGNOSTIC \"CEKE'S RAM TEST\"\n");
+    log_print(output_mode, " SYNTHÈSE DIAGNOSTIC \"CEKE'S RAM TEST v1.1\"\n");
     log_print(output_mode, "=====================================================================\n");
     log_print(output_mode, "[+] Erreurs Silencieuses WHEA/ECC : %llu\n", (unsigned long long)whea_errs);
-    log_print(output_mode, "[+] Statut Final : %s (%llu Erreurs Totales)\n", (total_system_errors == 0) ? "PASS (100% STABLE)" : "FAIL (INSTABLE)", (unsigned long long)total_system_errors);
+    log_print(output_mode, "[+] Total Biopsies Effectuees     : %ld\n", pool.biopsy_count);
+    log_print(output_mode, "[+] Statut Final                  : %s (%llu Erreurs Totales)\n", (total_system_errors == 0) ? "PASS (100% STABLE)" : "FAIL (INSTABLE)", (unsigned long long)total_system_errors);
 
-    if (output_mode == MODE_JSON_IPC) {
-        printf("{\"event\":\"finished\",\"status\":\"%s\",\"total_errors\":%llu}\n", (total_system_errors == 0) ? "PASS" : "FAIL", (unsigned long long)total_system_errors);
-        fflush(stdout);
+    if (driver_active) {
+        CEKES_LOCK_PAGE_REQ unlockReq;
+        DWORD ret = 0;
+        DeviceIoControl(hDriver, IOCTL_CEKES_UNLOCK_PHYSICAL_PAGE, &unlockReq, (DWORD)sizeof(unlockReq), &unlockReq, (DWORD)sizeof(unlockReq), &ret, NULL);
+        CloseHandle(hDriver);
     }
 
     VirtualFree(ram_buffer, 0, MEM_RELEASE);

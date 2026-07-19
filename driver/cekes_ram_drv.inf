@@ -1,0 +1,48 @@
+;
+; CEKES_RAM_DRV.INF - INF File for Ceke's RAM Test KMDF Kernel Driver
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = cekes_ram_drv.cat
+DriverVer   = 07/19/2026,3.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+cekes_ram_drv.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = CekesRam_Device, Root\CekesRamDriver
+
+[CekesRam_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+cekes_ram_drv.sys
+
+[CekesRam_Device.NT.Services]
+AddService = CekesRamDriver, 0x00000002, CekesRam_Service_Inst
+
+[CekesRam_Service_Inst]
+DisplayName    = %ServiceName%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\cekes_ram_drv.sys
+
+[Strings]
+ManufacturerName = "Ceke"
+DiskName         = "Ceke's RAM Test Driver Disk"
+DeviceDesc       = "Ceke's RAM Test Hardware Driver"
+ServiceName      = "CekesRamDriver"
