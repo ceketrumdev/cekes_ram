@@ -1,6 +1,6 @@
 @echo off
 echo =====================================================================
-echo  CEKE'S RAM TEST v1.1 - Build Script (MSVC x64 AVX2)
+echo  CEKE'S RAM TEST v1.2 - Build Script (MSVC x64 AVX2)
 echo =====================================================================
 
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" 2>nul

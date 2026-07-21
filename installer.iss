@@ -1,14 +1,14 @@
-; Script Inno Setup pour Ceke's RAM Test v1.1
+; Script Inno Setup pour Ceke's RAM Test v1.2
 
 [Setup]
 AppName=Ceke's RAM Test
-AppVersion=1.1.0
+AppVersion=1.2.0
 WizardStyle=modern
 DefaultDirName={autopf}\Ceke's RAM Test
 DefaultGroupName=Ceke's RAM Test
 Compression=lzma2
 SolidCompression=yes
-OutputBaseFilename=Setup_Cekes_RAM_Test_v1.1
+OutputBaseFilename=Setup_Cekes_RAM_Test_v1.2
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=admin
 

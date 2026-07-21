@@ -582,7 +582,7 @@ static uint64_t RunModule10_RandomStrideBankGroupHammeringChunk(uint8_t *chunk, 
     if (size < stride * 8) return 0;
 
     size_t max_rows = size / stride;
-    uint32_t seed = 0xC3E19857;
+    uint32_t seed = 0xC3E19857 ^ (uint32_t)(uintptr_t)chunk;
 
     for (uint64_t iter = 0; iter < iterations / 10; ++iter) {
         size_t r1 = (xorshift32(&seed) % (max_rows - 2));
@@ -620,7 +620,8 @@ static void PerformDeepBiopsyOnChunk(StressPool *pool, size_t chunk_idx, uint8_t
 
     for (size_t i = 0; i < word_count; ++i) {
         uint64_t val = words[i];
-        if (val != 0 && val != 0xFFFFFFFFFFFFFFFFULL && val != 0x5555555555555555ULL && val != 0xAAAAAAAAAAAAAAAAULL) {
+        /* Capturer les bit flips Stuck-at-0 et Stuck-at-1 sans exclure 0x0 */
+        if (val != 0xFFFFFFFFFFFFFFFFULL && val != 0x5555555555555555ULL && val != 0xAAAAAAAAAAAAAAAAULL) {
             LONG idx = InterlockedIncrement(&pool->biopsy_count) - 1;
             if (idx < MAX_BIOPSY_ERRORS) {
                 uint64_t va = (uint64_t)(uintptr_t)&words[i];
@@ -768,7 +769,7 @@ static void DrawTUIDashboard(StressPool *pool, ThreadContext *contexts, DWORD nu
     offset += snprintf(frame + offset, sizeof(frame) - offset,
         "\x1b[1;1H"
         ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET
-        ANSI_BOLD " CEKE'S RAM TEST v1.1 (AVX2 + KMDF KERNEL DRIVER)\x1b[K\n" ANSI_RESET
+        ANSI_BOLD " CEKE'S RAM TEST v1.2 (AVX2 + KMDF KERNEL DRIVER)\x1b[K\n" ANSI_RESET
         ANSI_CYAN "===================================================================================\x1b[K\n" ANSI_RESET
         " Mode Noyau     : %s\x1b[K\n",
         pool->is_driver_active ? ANSI_GREEN "[ACTIVE] Pilote Kernel cekes_ram_drv.sys connecté" ANSI_RESET : ANSI_YELLOW "[FALLBACK] Mode User-Space Windows API" ANSI_RESET
@@ -882,7 +883,7 @@ int main(int argc, char *argv[]) {
     g_log_file = fopen(LOG_FILE_PATH, "w");
 
     log_print(output_mode, "=====================================================================\n");
-    log_print(output_mode, " CEKE'S RAM TEST v1.1 (KMDF Kernel / AVX2 / 10 Modules)              \n");
+    log_print(output_mode, " CEKE'S RAM TEST v1.2 (KMDF Kernel / AVX2 / 10 Modules)              \n");
     log_print(output_mode, "=====================================================================\n\n");
 
     /* Tente la connexion au pilote Kernel KMDF */
@@ -1075,7 +1076,7 @@ int main(int argc, char *argv[]) {
     total_system_errors += whea_errs;
 
     log_print(output_mode, "\n=====================================================================\n");
-    log_print(output_mode, " SYNTHÈSE DIAGNOSTIC \"CEKE'S RAM TEST v1.1\"\n");
+    log_print(output_mode, " SYNTHÈSE DIAGNOSTIC \"CEKE'S RAM TEST v1.2\"\n");
     log_print(output_mode, "=====================================================================\n");
     log_print(output_mode, "[+] Erreurs Silencieuses WHEA/ECC : %llu\n", (unsigned long long)whea_errs);
     log_print(output_mode, "[+] Total Biopsies Effectuees     : %ld\n", pool.biopsy_count);
@@ -1088,6 +1089,7 @@ int main(int argc, char *argv[]) {
         CloseHandle(hDriver);
     }
 
+    VirtualUnlock(ram_buffer, alloc_bytes);
     VirtualFree(ram_buffer, 0, MEM_RELEASE);
     free(threads);
     free(contexts);

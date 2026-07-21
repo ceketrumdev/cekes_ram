@@ -2,7 +2,7 @@
 :: =====================================================================
 ::  INSTALL.BAT - Installateur Automatisé Ceke's RAM Test & Driver Kernel
 :: =====================================================================
-TITLE Ceke's RAM Test v1.1 - Installateur Administrateur
+TITLE Ceke's RAM Test v1.2 - Installateur Administrateur
 
 :: Auto-élévation Administrateur
 net session >nul 2>&1
@@ -13,7 +13,7 @@ if %errorlevel% neq 0 (
 )
 
 echo =====================================================================
-echo  INSTALLATION DE CEKE'S RAM TEST v1.1
+echo  INSTALLATION DE CEKE'S RAM TEST v1.2
 echo =====================================================================
 echo.
 

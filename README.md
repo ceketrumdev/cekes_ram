@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/License-MIT-00E676?style=for-the-badge"/>
 </p>
 
-<h1 align="center">⚡ Ceke's RAM Test v1.1</h1>
+<h1 align="center">⚡ Ceke's RAM Test v1.2</h1>
 
 <p align="center">
   <strong>An extremely aggressive bare-metal RAM stress testing tool & KMDF Kernel Driver for Windows x86_64<br>
@@ -15,13 +15,14 @@
 
 ---
 
-## Key Features in v1.1
+## Key Features in v1.2
 
 - **Automated 1-Click Installer (`install.bat`)** — Installs the application to `C:\Program Files\Ceke's RAM Test\`, registers the Windows Kernel Driver service (`CekesRamDriver`) via `sc.exe`, and creates Desktop & Start Menu shortcuts.
 - **KMDF Kernel Driver (`cekes_ram_drv.sys`)** — Includes a dedicated Windows Kernel-Mode driver to translate Virtual Addresses to 64-bit Physical Addresses (`MmGetPhysicalAddress`), lock physical MDL pages (`MmAllocatePagesForMdlEx`), and query CPU MSRs & SMBus TSOD RAM temperature sensors.
 - **Automatic Fallback Mode** — If the kernel driver is not loaded (e.g. Windows 11 DSE / HVCI enforcement), the tool seamlessly falls back to 100% native Windows User-Space APIs (`VirtualAllocExNuma`, `VirtualLock`, `SetThreadGroupAffinity`).
 - **10 Advanced AVX2 Stress Modules** — 10 specialized SIMD algorithms targeting TRR (Target Row Refresh) bypass, signal crosstalk, Vdroop power rail spikes, and DRAM charge decay.
-- **Deep Fault Biopsy Subsystem** — Automatically locks faulty 16 MB chunks, runs polarity checks (*Stuck-at-0* vs *Stuck-at-1*), 5s/10s/30s charge retention tests, and crosstalk analysis.
+- **Deep Fault Biopsy Subsystem v1.2** — Automatically locks faulty 16 MB chunks, captures 100% of bit-flips (*Stuck-at-0* and *Stuck-at-1* without zero filtering), 5s/10s/30s charge retention tests, and crosstalk analysis.
+- **Dynamic PRNG Bank-Group Rowhammering** — Seeded per chunk and thread address for truly distributed non-contiguous row hammering.
 - **Surgical Anti-Crash Logging** — Flushes error telemetry directly to disk using `_commit(_fileno)` and `FlushFileBuffers` before any potential BSOD or system freeze.
 
 ---
